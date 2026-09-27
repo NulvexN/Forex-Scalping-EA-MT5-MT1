@@ -1,0 +1,148 @@
+//@version=5
+// Independent TradingView illustration based on the public SCALPFLIP EA README.
+// It is not the proprietary EA, does not reproduce its unspecified SMART mode, and is not a port.
+// Starting chart suggestion: XAUUSD M5; the strategy also works on other chart timeframes/symbols.
+// Acceptance/rejection setups use a prior-bar range; MA/RSI/volume rules confirm them.
+// OB means latest opposite-color candle in the lookback (a transparent proxy, not full SMC logic).
+// No strategy settings imply or guarantee profitability.
+// Tester costs default to 0.05% commission per order and 1 tick of slippage; edit in Properties.
+strategy("SCALPFLIP-style Breakout Example (Independent)", overlay=true, pyramiding=0, initial_capital=10000, currency=currency.USD, commission_type=strategy.commission.percent, commission_value=0.05, slippage=1)
+
+string GROUP_SIGNAL = "Signal and filters"
+int fastMaLength = input.int(9, "Fast MA period", minval=1, group=GROUP_SIGNAL)
+int slowMaLength = input.int(21, "Slow MA period", minval=2, group=GROUP_SIGNAL)
+int trendMaLength = input.int(20, "Trend MA period", minval=1, group=GROUP_SIGNAL)
+int breakoutLookback = input.int(20, "Breakout lookback bars", minval=2, group=GROUP_SIGNAL)
+string entrySetup = input.string("Both", "Entry setup", options=["Acceptance", "Rejection", "Both"], group=GROUP_SIGNAL)
+int acceptanceBars = input.int(2, "Closes outside range for acceptance", minval=1, maxval=10, group=GROUP_SIGNAL)
+int rsiLength = input.int(14, "RSI period", minval=1, group=GROUP_SIGNAL)
+float rsiOversold = input.float(30.0, "RSI oversold level", minval=0, maxval=100, step=0.5, group=GROUP_SIGNAL)
+float rsiOverbought = input.float(70.0, "RSI overbought level", minval=0, maxval=100, step=0.5, group=GROUP_SIGNAL)
+bool useVolumeFilter = input.bool(false, "Enable volume filter", group=GROUP_SIGNAL)
+int volumeMaLength = input.int(20, "Volume average period", minval=1, group=GROUP_SIGNAL)
+bool requireOrderBlockRetest = input.bool(false, "Require order-block retest", group=GROUP_SIGNAL)
+int orderBlockLookback = input.int(10, "Order-block search bars", minval=1, maxval=100, group=GROUP_SIGNAL)
+bool requireFvgRetest = input.bool(false, "Require fair value gap (FVG) retest", group=GROUP_SIGNAL)
+
+string GROUP_RISK = "Fixed pip exits"
+int stopLossPips = input.int(20, "Stop Loss (pips)", minval=1, group=GROUP_RISK)
+int takeProfitPips = input.int(20, "Take Profit (pips)", minval=1, group=GROUP_RISK)
+int ticksPerPip = input.int(10, "Ticks per pip (adjust for symbol/broker)", minval=1, group=GROUP_RISK)
+float orderQuantity = input.float(1.0, "Order quantity (symbol units)", minval=0.01, step=0.01, group=GROUP_RISK)
+
+// Pine requires commission and slippage arguments in strategy() to be compile-time constants.
+// Change these defaults in Strategy Settings > Properties to model a different broker.
+float fastMa = ta.ema(close, fastMaLength)
+float slowMa = ta.ema(close, slowMaLength)
+float trendMa = ta.sma(close, trendMaLength)
+float rsiValue = ta.rsi(close, rsiLength)
+float averageVolume = ta.sma(volume, volumeMaLength)
+bool volumeConfirmed = not useVolumeFilter or (not na(volume) and not na(averageVolume) and volume > averageVolume)
+float priorRangeHigh = ta.highest(high[1], breakoutLookback)
+float priorRangeLow = ta.lowest(low[1], breakoutLookback)
+bool bullishAccepted = true
+bool bearishAccepted = true
+for i = 0 to acceptanceBars - 1
+    bullishAccepted := bullishAccepted and not na(priorRangeHigh[i]) and close[i] > priorRangeHigh[i]
+    bearishAccepted := bearishAccepted and not na(priorRangeLow[i]) and close[i] < priorRangeLow[i]
+bool bullishAcceptance = bullishAccepted and not bullishAccepted[1]
+bool bearishAcceptance = bearishAccepted and not bearishAccepted[1]
+bool bullishRejection = not na(priorRangeLow) and low < priorRangeLow and close > priorRangeLow and close > open
+bool bearishRejection = not na(priorRangeHigh) and high > priorRangeHigh and close < priorRangeHigh and close < open
+bool useAcceptance = entrySetup != "Rejection"
+bool useRejection = entrySetup != "Acceptance"
+bool bullishSetup = (useAcceptance and bullishAcceptance) or (useRejection and bullishRejection)
+bool bearishSetup = (useAcceptance and bearishAcceptance) or (useRejection and bearishRejection)
+
+// Order-block proxy: the latest opposite-color candle within the search window.
+float latestBearCandleHigh = na
+float latestBearCandleLow = na
+float latestBullCandleHigh = na
+float latestBullCandleLow = na
+for i = 1 to orderBlockLookback
+    if na(latestBearCandleHigh) and close[i] < open[i]
+        latestBearCandleHigh := high[i]
+        latestBearCandleLow := low[i]
+    if na(latestBullCandleHigh) and close[i] > open[i]
+        latestBullCandleHigh := high[i]
+        latestBullCandleLow := low[i]
+bool bullishOrderBlockRetest = not na(latestBearCandleHigh) and low <= latestBearCandleHigh and close >= latestBearCandleLow and close > open
+bool bearishOrderBlockRetest = not na(latestBullCandleHigh) and high >= latestBullCandleLow and close <= latestBullCandleHigh and close < open
+
+// Three-candle imbalance; only prior gaps qualify as retests.
+bool bullishFvgCreated = bar_index >= 2 and low > high[2]
+bool bearishFvgCreated = bar_index >= 2 and high < low[2]
+float latestBullFvgTop = ta.valuewhen(bullishFvgCreated, low, 0)
+float latestBullFvgBottom = ta.valuewhen(bullishFvgCreated, high[2], 0)
+float latestBearFvgTop = ta.valuewhen(bearishFvgCreated, low[2], 0)
+float latestBearFvgBottom = ta.valuewhen(bearishFvgCreated, high, 0)
+bool bullishFvgRetest = not bullishFvgCreated and not na(latestBullFvgBottom) and low <= latestBullFvgTop and close >= latestBullFvgBottom
+bool bearishFvgRetest = not bearishFvgCreated and not na(latestBearFvgTop) and high >= latestBearFvgBottom and close <= latestBearFvgTop
+
+bool bullishConfirmation = close > trendMa and fastMa > slowMa and rsiValue > 50 and rsiValue < rsiOverbought
+bool bearishConfirmation = close < trendMa and fastMa < slowMa and rsiValue < 50 and rsiValue > rsiOversold
+bool bullishBlocksAllowed = not requireOrderBlockRetest or bullishOrderBlockRetest
+bool bearishBlocksAllowed = not requireOrderBlockRetest or bearishOrderBlockRetest
+bool bullishFvgAllowed = not requireFvgRetest or bullishFvgRetest
+bool bearishFvgAllowed = not requireFvgRetest or bearishFvgRetest
+bool buySignal = barstate.isconfirmed and strategy.position_size == 0 and bullishSetup and bullishConfirmation and volumeConfirmed and bullishBlocksAllowed and bullishFvgAllowed
+bool sellSignal = barstate.isconfirmed and strategy.position_size == 0 and bearishSetup and bearishConfirmation and volumeConfirmed and bearishBlocksAllowed and bearishFvgAllowed
+
+if buySignal
+    strategy.entry("Buy", strategy.long, qty=orderQuantity)
+    strategy.exit("Buy exit", from_entry="Buy", loss=stopLossPips * ticksPerPip, profit=takeProfitPips * ticksPerPip)
+    alert("Independent SCALPFLIP-style BUY: acceptance/rejection with filters", alert.freq_once_per_bar_close)
+
+if sellSignal
+    strategy.entry("Sell", strategy.short, qty=orderQuantity)
+    strategy.exit("Sell exit", from_entry="Sell", loss=stopLossPips * ticksPerPip, profit=takeProfitPips * ticksPerPip)
+    alert("Independent SCALPFLIP-style SELL: acceptance/rejection with filters", alert.freq_once_per_bar_close)
+
+plot(fastMa, title="Fast EMA (9)", color=color.teal, linewidth=2)
+plot(slowMa, title="Slow EMA (21)", color=color.orange, linewidth=2)
+plot(trendMa, title="Trend SMA (20)", color=color.blue, linewidth=2)
+plot(priorRangeHigh, title="Range resistance", color=color.new(color.green, 65))
+plot(priorRangeLow, title="Range support", color=color.new(color.red, 65))
+plot(requireOrderBlockRetest ? latestBearCandleHigh : na, title="Bullish OB proxy top", color=color.new(color.aqua, 45), style=plot.style_stepline)
+plot(requireOrderBlockRetest ? latestBearCandleLow : na, title="Bullish OB proxy bottom", color=color.new(color.aqua, 45), style=plot.style_stepline)
+plot(requireOrderBlockRetest ? latestBullCandleHigh : na, title="Bearish OB proxy top", color=color.new(color.fuchsia, 45), style=plot.style_stepline)
+plot(requireOrderBlockRetest ? latestBullCandleLow : na, title="Bearish OB proxy bottom", color=color.new(color.fuchsia, 45), style=plot.style_stepline)
+plot(requireFvgRetest ? latestBullFvgTop : na, title="Bullish FVG top", color=color.new(color.green, 40), style=plot.style_stepline)
+plot(requireFvgRetest ? latestBullFvgBottom : na, title="Bullish FVG bottom", color=color.new(color.green, 40), style=plot.style_stepline)
+plot(requireFvgRetest ? latestBearFvgTop : na, title="Bearish FVG top", color=color.new(color.red, 40), style=plot.style_stepline)
+plot(requireFvgRetest ? latestBearFvgBottom : na, title="Bearish FVG bottom", color=color.new(color.red, 40), style=plot.style_stepline)
+plotshape(buySignal, title="Buy setup", style=shape.labelup, location=location.belowbar, color=color.new(color.green, 0), text="BUY", textcolor=color.white, size=size.tiny)
+plotshape(sellSignal, title="Sell setup", style=shape.labeldown, location=location.abovebar, color=color.new(color.red, 0), text="SELL", textcolor=color.white, size=size.tiny)
+
+var table statsTable = table.new(position.top_right, 2, 6, border_width=1)
+int tpTrades = 0
+int slTrades = 0
+int otherTrades = 0
+float pipSize = syminfo.mintick * ticksPerPip
+float priceTolerance = syminfo.mintick
+if barstate.islast and strategy.closedtrades > 0
+    for tradeNumber = 0 to strategy.closedtrades - 1
+        string entryId = strategy.closedtrades.entry_id(tradeNumber)
+        float entryPrice = strategy.closedtrades.entry_price(tradeNumber)
+        float exitPrice = strategy.closedtrades.exit_price(tradeNumber)
+        float favorableMove = entryId == "Buy" ? exitPrice - entryPrice : entryPrice - exitPrice
+        if favorableMove >= takeProfitPips * pipSize - priceTolerance
+            tpTrades := tpTrades + 1
+        else if favorableMove <= -stopLossPips * pipSize + priceTolerance
+            slTrades := slTrades + 1
+        else
+            otherTrades := otherTrades + 1
+float winRate = strategy.closedtrades > 0 ? tpTrades * 100.0 / strategy.closedtrades : 0.0
+if barstate.islast
+    table.cell(statsTable, 0, 0, "Backtest stats", bgcolor=color.new(color.blue, 20), text_color=color.white)
+    table.cell(statsTable, 1, 0, "Trades", bgcolor=color.new(color.blue, 20), text_color=color.white)
+    table.cell(statsTable, 0, 1, "Total closed")
+    table.cell(statsTable, 1, 1, str.tostring(strategy.closedtrades))
+    table.cell(statsTable, 0, 2, "TP hits", text_color=color.green)
+    table.cell(statsTable, 1, 2, str.tostring(tpTrades), text_color=color.green)
+    table.cell(statsTable, 0, 3, "SL hits", text_color=color.red)
+    table.cell(statsTable, 1, 3, str.tostring(slTrades), text_color=color.red)
+    table.cell(statsTable, 0, 4, "Other / BE")
+    table.cell(statsTable, 1, 4, str.tostring(otherTrades))
+    table.cell(statsTable, 0, 5, "TP win rate")
+    table.cell(statsTable, 1, 5, str.tostring(winRate, "#.##") + "%")
